@@ -9,7 +9,7 @@ from sklearn.preprocessing import PolynomialFeatures
 
 # Page configuration
 st.set_page_config(
-    page_title=" American Option Pricing",
+    page_title="AI-Powered American Option Pricing",
     page_icon="💹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -53,7 +53,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Streamlit interface
-st.title("📊 American Option Pricing Model")
+st.title("📊 Advanced Option Pricing Model")
 
 # Sidebar configuration
 with st.sidebar:
