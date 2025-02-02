@@ -178,12 +178,9 @@ def american_option_pricing(S0, K, T, r, sigma, option_type='put',
                 close=df['Close']
             )])
             fig.update_layout(
-                title='Live Market Simulation',
-                xaxis_title='Time',
-                yaxis_title='Price (₹)',
                 template='plotly_white',
-                height=300,
-                margin=dict(l=20, r=20, t=40, b=20)
+                height=200,
+                margin=dict(l=10, r=10, t=20, b=10)
             )
             chart_placeholder.plotly_chart(fig, use_container_width=True)
     
