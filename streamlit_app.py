@@ -105,7 +105,6 @@ def generate_asset_paths(S0, r, sigma, T, M, N, seed=None):
 # Add this function to generate fake candlestick data
 def generate_fake_candles(num=20, initial_price=100):
     np.random.seed()
-    dates = pd.date_range(end=pd.Timestamp.today(), periods=num, freq='15min')
     prices = []
     current_price = initial_price
     
