@@ -9,7 +9,7 @@ from sklearn.preprocessing import PolynomialFeatures
 
 # Page configuration
 st.set_page_config(
-    page_title="AI-Powered American Option Pricing",
+    page_title=" American Option Pricing",
     page_icon="💹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -53,7 +53,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Streamlit interface
-st.title("📊 Advanced Option Pricing Model")
+st.title("📊 American Option Pricing Model")
 
 # Sidebar configuration
 with st.sidebar:
@@ -113,6 +113,13 @@ def generate_fake_candles(num=20, initial_price=100):
         movement = np.random.choice([0.98, 0.99, 1.0, 1.01, 1.02])
         current_price *= movement + np.random.normal(0, 0.005)
         prices.append(current_price)
+    
+    df = pd.DataFrame({'Date': dates, 'Close': prices})
+    df['Open'] = df['Close'].shift(1).fillna(initial_price)
+    df['High'] = df[['Open', 'Close']].max(axis=1) * np.random.uniform(1.0, 1.02, num)
+    df['Low'] = df[['Open', 'Close']].min(axis=1) * np.random.uniform(0.98, 1.0, num)
+    df['Close'] = df['Close'] * np.random.uniform(0.99, 1.01, num)
+    return df
 
 
 def american_option_pricing(S0, K, T, r, sigma, option_type='put', 
@@ -171,9 +178,12 @@ def american_option_pricing(S0, K, T, r, sigma, option_type='put',
                 close=df['Close']
             )])
             fig.update_layout(
+                title='Live Market Simulation',
+                xaxis_title='Time',
+                yaxis_title='Price (₹)',
                 template='plotly_white',
                 height=300,
-                margin=dict(l=10, r=10, t=20, b=10)
+                margin=dict(l=20, r=20, t=40, b=20)
             )
             chart_placeholder.plotly_chart(fig, use_container_width=True)
     
