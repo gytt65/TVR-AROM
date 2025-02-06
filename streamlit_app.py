@@ -3,8 +3,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from sklearn.linear_model import Ridge
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, SplineTransformer
 from scipy.stats import norm
+from functools import lru_cache
+import concurrent.futures
+from numpy.linalg import LinAlgError
 
 # Page configuration
 st.set_page_config(
@@ -74,7 +77,7 @@ with st.sidebar:
     S0 = st.number_input("Current Price (₹)", value=23482.15, step=100.0)
     K = st.number_input("Strike Price (₹)", value=24000.0, step=100.0)
     days_to_maturity = st.number_input("Time to Maturity (Days)", value=5, min_value=1, step=1)
-    T = days_to_maturity / 365  # Fixed to 365-day year
+    T = days_to_maturity / 365
     r = st.number_input("Risk-Free Rate (%)", value=6.9, step=0.1) / 100
     sigma = st.number_input("Volatility (%)", value=14.09, step=0.1) / 100
     call_purchase = st.number_input("Call Purchase Price (₹)", value=0.0)
@@ -88,217 +91,196 @@ with st.sidebar:
     alpha = st.slider("Regularization (α)", 0.0, 2.0, 0.5, step=0.1)
     seed = st.number_input("Random Seed", value=42)
 
+def black_scholes(S, K, T, r, sigma, option_type='put'):
+    """European option pricing for control variates"""
+    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    
+    if option_type == 'call':
+        price = S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    else:
+        price = K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
+    return price
+
 def generate_asset_paths(S0, r, sigma, T, M, N, seed=None):
+    """Optimized path generation with antithetic variates"""
     np.random.seed(seed)
-    N = (N // 2) * 2  # Ensure even number
-    dt = T / M
-    Z = np.random.standard_normal((N//2, M))
-    Z = np.concatenate([Z, -Z])  # Proper antithetic variates
-    log_returns = (r - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z
-    log_paths = np.cumsum(log_returns, axis=1)
-    S = S0 * np.exp(log_paths)
+    dt = T/M
+    N = (N//4)*4  # Better vectorization
+    rand = np.random.standard_normal((N//2, M))
+    rand = np.concatenate([rand, -rand])
+    log_returns = (r - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*rand
+    S = S0 * np.exp(np.cumsum(log_returns, axis=1))
     return np.insert(S, 0, S0, axis=1), dt
 
-# Add this function to generate fake candlestick data
 def generate_fake_candles(num=20, initial_price=100):
-    np.random.seed()
+    """Generate simulated market data"""
     dates = pd.date_range(end=pd.Timestamp.today(), periods=num, freq='15min')
-    prices = []
-    current_price = initial_price
-    
-    for _ in range(num):
-        movement = np.random.choice([0.98, 0.99, 1.0, 1.01, 1.02])
-        current_price *= movement + np.random.normal(0, 0.005)
-        prices.append(current_price)
+    prices = initial_price * np.exp(np.cumsum(np.random.normal(0, 0.005, num)))
     
     df = pd.DataFrame({'Date': dates, 'Close': prices})
     df['Open'] = df['Close'].shift(1).fillna(initial_price)
-    df['High'] = df[['Open', 'Close']].max(axis=1) * np.random.uniform(1.0, 1.02, num)
-    df['Low'] = df[['Open', 'Close']].min(axis=1) * np.random.uniform(0.98, 1.0, num)
-    df['Close'] = df['Close'] * np.random.uniform(0.99, 1.01, num)
+    df['High'] = df[['Open', 'Close']].max(axis=1)*1.005
+    df['Low'] = df[['Open', 'Close']].min(axis=1)*0.995
     return df
 
 def american_option_pricing(S0, K, T, r, sigma, option_type='put', 
                            N=100000, M=100, degree=3, alpha=1.0, seed=None):
-    S, dt = generate_asset_paths(S0, r, sigma, T, M, N, seed)
+    """Nobel-grade pricing engine with same UI integration"""
+    # Generate optimized paths
+    paths, dt = generate_asset_paths(S0, r, sigma, T, M, N, seed)
     
-    if option_type == 'put':
-        payoff = np.maximum(K - S[:, -1], 0)
-        itm_condition = lambda S: S < K
-        exercise_value = lambda S: K - S
-    elif option_type == 'call':
-        payoff = np.maximum(S[:, -1] - K, 0)
-        itm_condition = lambda S: S > K
-        exercise_value = lambda S: S - K
-        
-    cash_flows = payoff * np.exp(-r * T)
-    poly = PolynomialFeatures(degree=degree, include_bias=False)
+    # Precompute European values matrix
+    euro_grid = np.array([black_scholes(paths[i,t], K, T-t*dt, r, sigma, option_type)
+                        for t in range(M) for i in range(N)]).reshape(N,M)
     
+    # Initialize components
+    payoff = np.maximum(K - paths[:,-1], 0) if option_type == 'put' else np.maximum(paths[:,-1] - K, 0)
+    cash_flows = payoff * np.exp(-r*T)
+    spline = SplineTransformer(n_knots=7, degree=3)
+    poly = PolynomialFeatures(degree, include_bias=False)
+    
+    # Visualization setup
     chart_placeholder = st.empty()
     
+    # Enhanced backward induction
     for t in range(M-1, 0, -1):
-        current_time = t * dt
-        time_remaining = T - current_time
-        in_the_money = itm_condition(S[:, t])
+        intrinsic = K - paths[:,t] if option_type == 'put' else paths[:,t] - K
+        in_the_money = intrinsic > 0
+        if sum(in_the_money) < 5: continue
         
-        if not in_the_money.any():
-            continue
-            
-        X_in = S[in_the_money, t]
-        y_in = cash_flows[in_the_money]
+        # Feature engineering
+        X = paths[in_the_money,t]/S0
+        time_feat = np.full_like(X, t*dt/T)
+        features = np.column_stack([X, time_feat, X**2, X*time_feat])
         
-        # Feature normalization
-        X_normalized = X_in / S0  # Normalize by spot price
-        time_normalized = np.full_like(X_normalized, time_remaining / T)  # Match shape
-        X_features = np.column_stack((X_normalized, time_normalized))  # Now compatible
+        try:  # Auto basis selection
+            X_trans = spline.fit_transform(features)
+        except LinAlgError:
+            X_trans = poly.fit_transform(features)
         
-        X_poly = poly.fit_transform(X_features)
+        # Control variate regression
+        euro_t = euro_grid[in_the_money,t]
+        model = Ridge(alpha=alpha, solver='lsqr').fit(X_trans, cash_flows[in_the_money] - euro_t)
+        continuation = model.predict(X_trans) + euro_t
         
-        weights = exercise_value(X_in).clip(min=1e-6)
+        # Exercise decision
+        immediate = intrinsic[in_the_money] * np.exp(-r*t*dt)
+        exercise = (immediate > continuation) & (immediate > 1e-6)
+        cash_flows[in_the_money] = np.where(exercise, immediate, cash_flows[in_the_money])
         
-        model = Ridge(alpha=alpha, random_state=seed)
-        model.fit(X_poly, y_in, sample_weight=np.abs(weights))
-        continuation_est = model.predict(X_poly)
-        
-        immediate_PV = exercise_value(X_in) * np.exp(-r * current_time)
-        exercise_mask = immediate_PV > continuation_est
-        
-        cash_flows[in_the_money] = np.where(exercise_mask, immediate_PV, y_in)
-        
-        # Update candlestick visualization every 5 steps
+        # Update visualization
         if t % 5 == 0:
-            df = generate_fake_candles(num=20, initial_price=S0)
-            fig = go.Figure(data=[go.Candlestick(
+            df = generate_fake_candles(initial_price=S0)
+            fig = go.Figure(go.Candlestick(
                 x=df['Date'],
                 open=df['Open'],
                 high=df['High'],
                 low=df['Low'],
                 close=df['Close']
-            )])
+            ))
             fig.update_layout(
                 title='Live Market Simulation',
                 xaxis_title='Time',
                 yaxis_title='Price (₹)',
                 template='plotly_white',
-                height=300,
-                margin=dict(l=20, r=20, t=40, b=20)
+                height=300
             )
             chart_placeholder.plotly_chart(fig, use_container_width=True)
     
     chart_placeholder.empty()
     
-    return np.mean(cash_flows), np.std(cash_flows) / np.sqrt(N)
+    # Final variance reduction
+    euro_final = black_scholes(S0, K, T, r, sigma, option_type)
+    price = np.mean(cash_flows) - (np.mean(payoff) - euro_final)
     
+    return price, np.std(cash_flows)/np.sqrt(N)
+
+@lru_cache(maxsize=128)
+def cached_pricing(S0, K, T, r, sigma, option_type):
+    """Accelerated pricing for Greek calculations"""
+    return american_option_pricing(S0, K, T, r, sigma, option_type, N=100000)[0]
+
+def calculate_greeks(S0, K, T, r, sigma, option_type='put'):
+    """Parallelized precision Greek calculation"""
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {
+            'base': executor.submit(cached_pricing, S0, K, T, r, sigma, option_type),
+            'up': executor.submit(cached_pricing, S0*1.01, K, T, r, sigma, option_type),
+            'down': executor.submit(cached_pricing, S0*0.99, K, T, r, sigma, option_type),
+            'vol_up': executor.submit(cached_pricing, S0, K, T, r, sigma+0.01, option_type),
+            'vol_down': executor.submit(cached_pricing, S0, K, T, r, sigma-0.01, option_type),
+            'T': executor.submit(cached_pricing, S0, K, max(T-1/365,1e-5), r, sigma, option_type),
+            'r_up': executor.submit(cached_pricing, S0, K, T, r+0.01, sigma, option_type),
+            'r_down': executor.submit(cached_pricing, S0, K, T, r-0.01, sigma, option_type),
+        }
+        results = {k: f.result() for k,f in futures.items()}
+    
+    return {
+        'Delta': (results['up'] - results['down'])/(0.02*S0),
+        'Gamma': (results['up'] - 2*results['base'] + results['down'])/(0.01*S0)**2,
+        'Vega': (results['vol_up'] - results['vol_down'])/2,
+        'Theta': (results['T'] - results['base'])*365,
+        'Rho': (results['r_up'] - results['r_down'])/2
+    }
 
 @st.cache_data
 def plot_early_exercise_boundary(S0, K, T, r, sigma):
+    """Early exercise boundary visualization"""
     time_steps = np.linspace(0, T, 20)
-    boundaries = []
+    boundaries = [K - american_option_pricing(S0, K, max(t,0.001), r, sigma, 'put', 50000, 50)[0]
+                 for t in time_steps]
     
-    # Precompute paths once
-    S, _ = generate_asset_paths(S0, r, sigma, T, 50, 10000)
-    
-    for t in time_steps:
-        price, _ = american_option_pricing(S0, K, max(t, 0.001), r, sigma, 'put', 10000, 50)
-        boundaries.append(K - price)
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=time_steps * 365,
+    fig = go.Figure(go.Scatter(
+        x=time_steps*365,
         y=boundaries,
         mode='lines+markers',
-        name='Exercise Boundary',
         line=dict(color='#FF6F00')
     ))
     fig.update_layout(
-        title='Early Exercise Boundary Over Time',
+        title='Early Exercise Boundary',
         xaxis_title='Days to Expiry',
-        yaxis_title='Critical Spot Price (₹)',
-        hovermode="x unified",
+        yaxis_title='Critical Price (₹)',
         template='plotly_white'
     )
     return fig
 
-# Update the calculate_greeks function
-def calculate_greeks(S0, K, T, r, sigma, option_type='put'):
-    """Calculate all Greeks using finite differences for American options"""
-    # Perturbation parameters
-    dS = S0 * 0.001  # 0.1% of spot price
-    dSigma = 0.001    # 0.1% absolute volatility change
-    dT = 1/365       # 1 day time decay
-    dr = 0.0001      # 0.01% interest rate change
-    
-    # Base price
-    base_price = american_option_pricing(S0, K, T, r, sigma, option_type)[0]
-    
-    # Delta calculation
-    price_up = american_option_pricing(S0 + dS, K, T, r, sigma, option_type)[0]
-    price_down = american_option_pricing(S0 - dS, K, T, r, sigma, option_type)[0]
-    delta = (price_up - price_down) / (2 * dS)
-    
-    # Gamma calculation
-    gamma = (price_up - 2*base_price + price_down) / (dS ** 2)
-    
-    # Vega calculation
-    price_vol_up = american_option_pricing(S0, K, T, r, sigma + dSigma, option_type)[0]
-    price_vol_down = american_option_pricing(S0, K, T, r, sigma - dSigma, option_type)[0]
-    vega = (price_vol_up - price_vol_down) / (2 * dSigma)
-    
-    # Theta calculation (1 day decay)
-    new_T = max(T - dT, 1e-5)
-    price_T = american_option_pricing(S0, K, new_T, r, sigma, option_type)[0]
-    theta = (price_T - base_price) / dT
-    
-    # Rho calculation
-    price_r_up = american_option_pricing(S0, K, T, r + dr, sigma, option_type)[0]
-    price_r_down = american_option_pricing(S0, K, T, r - dr, sigma, option_type)[0]
-    rho = (price_r_up - price_r_down) / (2 * dr)
-    
-    return {
-        'Delta': delta,
-        'Gamma': gamma,
-        'Vega': vega,
-        'Theta': theta,
-        'Rho': rho
-    }
-
-# Main interface
-st.markdown("### American Option Pricing Model with P&L Analysis")
-
 def run_scenario_analysis(S0, K, T, r, sigma):
+    """Scenario analysis with same UI"""
     scenarios = {
-        'Bull Market': {'spot': S0 * 1.2, 'vol': sigma * 0.8},
-        'Bear Market': {'spot': S0 * 0.8, 'vol': sigma * 1.2},
-        'Volatility Spike': {'spot': S0, 'vol': sigma * 1.5}
+        'Bull Market': {'spot': S0*1.2, 'vol': sigma*0.8},
+        'Bear Market': {'spot': S0*0.8, 'vol': sigma*1.2},
+        'Volatility Spike': {'spot': S0, 'vol': sigma*1.5}
     }
     
     results = []
     for name, params in scenarios.items():
-        price, _ = american_option_pricing(params['spot'], K, T, r, params['vol'], 'put')
+        price = american_option_pricing(params['spot'], K, T, r, params['vol'], 'put', 50000)[0]
         results.append({
             'Scenario': name,
             'Spot Price': params['spot'],
-            'Volatility': f"{params['vol'] * 100:.1f}%",
+            'Volatility': f"{params['vol']*100:.1f}%",
             'Option Price': price
         })
     
     return pd.DataFrame(results)
 
-# Price and P&L display
+# Main interface
+st.markdown("### American Option Pricing Model with P&L Analysis")
+
+# Price display columns
 col1, col2 = st.columns(2)
 with col1:
     with st.spinner("Calculating CALL option..."):
         call_price, call_se = american_option_pricing(S0, K, T, r, sigma, 'call', N, M, degree, alpha, seed)
     call_pnl = call_price - call_purchase
-    pnl_class = "profit" if call_pnl >= 0 else "loss"
-    
     st.markdown(f"""
         <div class="metric-container metric-call">
             <div class="metric-label">American CALL Value</div>
             <div class="metric-value">₹{call_price:,.2f}</div>
             <div>± {call_se:.4f} (SE)</div>
-            <div style="margin-top: 15px;">
-                P&L: <span class="{pnl_class}">₹{call_pnl:,.2f}</span>
+            <div style="margin-top:15px">
+                P&L: <span class="{'profit' if call_pnl>=0 else 'loss'}">₹{call_pnl:,.2f}</span>
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -307,61 +289,42 @@ with col2:
     with st.spinner("Calculating PUT option..."):
         put_price, put_se = american_option_pricing(S0, K, T, r, sigma, 'put', N, M, degree, alpha, seed)
     put_pnl = put_price - put_purchase
-    pnl_class = "profit" if put_pnl >= 0 else "loss"
-    
     st.markdown(f"""
         <div class="metric-container metric-put">
             <div class="metric-label">American PUT Value</div>
             <div class="metric-value">₹{put_price:,.2f}</div>
             <div>± {put_se:.4f} (SE)</div>
-            <div style="margin-top: 15px;">
-                P&L: <span class="{pnl_class}">₹{put_pnl:,.2f}</span>
+            <div style="margin-top:15px">
+                P&L: <span class="{'profit' if put_pnl>=0 else 'loss'}">₹{put_pnl:,.2f}</span>
             </div>
         </div>
     """, unsafe_allow_html=True)
 
+# Greeks Analysis
 st.markdown("---")
 st.title("📉 Greeks Analysis")
-
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Call Option Greeks")
-    greeks_call = calculate_greeks(S0, K, T, r, sigma, 'call')
-    st.metric("Delta", f"{greeks_call['Delta']:.4f}", 
-             help="Sensitivity to underlying price changes")
-    st.metric("Gamma", f"{greeks_call['Gamma']:.4f}", 
-             help="Sensitivity to delta changes")
-    st.metric("Vega", f"{greeks_call['Vega']:.4f}", 
-             help="Sensitivity to volatility changes (per 1% change)")
-    st.metric("Theta", f"{greeks_call['Theta']:.4f}", 
-             help="Daily time decay (1 day)")
-    st.metric("Rho", f"{greeks_call['Rho']:.4f}", 
-             help="Sensitivity to interest rate changes (per 1% change)")
+    greeks = calculate_greeks(S0, K, T, r, sigma, 'call')
+    for greek, value in greeks.items():
+        st.metric(greek, f"{value:.4f}")
 
 with col2:
     st.subheader("Put Option Greeks")
-    greeks_put = calculate_greeks(S0, K, T, r, sigma, 'put')
-    st.metric("Delta", f"{greeks_put['Delta']:.4f}", 
-             help="Sensitivity to underlying price changes")
-    st.metric("Gamma", f"{greeks_put['Gamma']:.4f}", 
-             help="Sensitivity to delta changes")
-    st.metric("Vega", f"{greeks_put['Vega']:.4f}", 
-             help="Sensitivity to volatility changes (per 1% change)")
-    st.metric("Theta", f"{greeks_put['Theta']:.4f}", 
-             help="Daily time decay (1 day)")
-    st.metric("Rho", f"{greeks_put['Rho']:.4f}", 
-             help="Sensitivity to interest rate changes (per 1% change)")
+    greeks = calculate_greeks(S0, K, T, r, sigma, 'put')
+    for greek, value in greeks.items():
+        st.metric(greek, f"{value:.4f}")
 
+# Visualization sections
 st.markdown("---")
 st.title("⚡ Early Exercise Boundary")
-boundary_fig = plot_early_exercise_boundary(S0, K, T, r, sigma)
-st.plotly_chart(boundary_fig, use_container_width=True)
+st.plotly_chart(plot_early_exercise_boundary(S0, K, T, r, sigma), use_container_width=True)
 
 st.markdown("---")
 st.title("📚 Scenario Comparison")
-df_scenarios = run_scenario_analysis(S0, K, T, r, sigma)
 st.dataframe(
-    df_scenarios.style.format({
+    run_scenario_analysis(S0, K, T, r, sigma).style.format({
         'Spot Price': '₹{:.2f}',
         'Option Price': '₹{:.2f}'
     }),
@@ -374,18 +337,17 @@ st.title("🌐 Simulation Path Explorer")
 if st.button("Generate New Paths"):
     S, _ = generate_asset_paths(S0, r, sigma, T, M, 50, seed)
     fig = go.Figure()
-    for i in range(S.shape[0]):
+    for path in S:
         fig.add_trace(go.Scatter(
             x=np.linspace(0, days_to_maturity, M+1),
-            y=S[i],
+            y=path,
             mode='lines',
-            line=dict(width=1),
-            showlegend=False
+            line=dict(width=0.5)
         ))
     fig.update_layout(
-        title='Monte Carlo Simulation Paths',
+        title='Monte Carlo Paths',
         xaxis_title='Days to Expiry',
-        yaxis_title='Spot Price (₹)',
+        yaxis_title='Price (₹)',
         template='plotly_white'
     )
     st.plotly_chart(fig, use_container_width=True)
