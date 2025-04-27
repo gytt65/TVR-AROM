@@ -8,7 +8,7 @@ from scipy.stats import norm
 
 # Page configuration
 st.set_page_config(
-    page_title="AI-Powered American Option Pricing",
+    page_title="American Option Pricing model",
     page_icon="💹",
     layout="wide",
     initial_sidebar_state="expanded"
